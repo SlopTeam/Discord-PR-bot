@@ -3,7 +3,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
-const { REST, Routes, EmbedBuilder } = require('discord.js');
+const { REST, Routes, EmbedBuilder, Client, GatewayIntentBits, ActivityType } = require('discord.js');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? process.env.TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? process.env.GH_AUTH;
@@ -46,6 +46,27 @@ console.log('Repos suivis :', Object.values(repos).map(repo => repo.fullName).jo
 
 // ? - Discord en REST uniquement : pas de connexion gateway, donc compatible avec Cloud Run (scale à zéro)
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+
+// ? - DISCORD_GATEWAY=true : le bot reste connecté (en ligne), et passe en « Ne pas déranger » quand un webhook échoue
+const gateway = process.env.DISCORD_GATEWAY === 'true'
+	? new Client({ intents: [GatewayIntentBits.Guilds] })
+	: null;
+
+const setStatus = (error) => {
+	if (!gateway?.isReady()) return;
+	gateway.user.setPresence(error
+		? { status: 'dnd', activities: [{ name: `Erreur : ${error.message}`.slice(0, 128), type: ActivityType.Custom }] }
+		: { status: 'online', activities: [{ name: `Surveille ${Object.keys(repos).length} repos`, type: ActivityType.Watching }] });
+};
+
+if (gateway) {
+	gateway.once('ready', () => {
+		console.log(`Connecté au gateway en tant que ${gateway.user.tag}`);
+		setStatus();
+	});
+	gateway.on('error', error => console.error('Erreur gateway Discord :', error));
+	gateway.login(DISCORD_TOKEN).catch(error => console.error('Connexion gateway impossible :', error.message));
+}
 
 let botUserId;
 const getBotUserId = async () => {
@@ -219,9 +240,11 @@ app.post('/', express.json({ limit: '5mb', verify: (req, _res, buffer) => { req.
 
 	try {
 		res.send(await enqueue(() => handleEvent(event, req.body, repo)));
+		setStatus();
 	}
 	catch (error) {
 		console.error(`Erreur sur ${event}.${req.body.action} (${repo.fullName}) :`, error);
+		setStatus(error);
 		res.status(500).send('Erreur interne');
 	}
 });
