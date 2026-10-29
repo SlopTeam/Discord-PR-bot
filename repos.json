@@ -1,0 +1,6 @@
+{
+  "repos": {
+    "SlopTeam/SlopBattle-back": { "label": "Back", "colour": "#E67E22" },
+    "SlopTeam/SlopBattle-front": { "label": "Front", "colour": "#3498DB" }
+  }
+}

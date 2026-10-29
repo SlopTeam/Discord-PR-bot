@@ -1,396 +1,229 @@
-const { Octokit } = require('octokit');
-const { Client, EmbedBuilder, GatewayIntentBits } = require('discord.js');
-const btoa = require('btoa');
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const express = require('express');
-const app = express();
 require('dotenv').config();
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const express = require('express');
+const { REST, Routes, EmbedBuilder } = require('discord.js');
 
-app.use(express.json());
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? process.env.TOKEN;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? process.env.GH_AUTH;
+const { GITHUB_WEBHOOK_SECRET, CHANNEL_ID } = process.env;
+const PORT = process.env.PORT ?? 8080;
 
+// ? - Liste des repos suivis : repos.json par défaut, ou la variable REPOS_JSON (même format)
+const loadRepos = () => {
+	const raw = process.env.REPOS_JSON
+		?? fs.readFileSync(process.env.REPOS_FILE ?? path.join(__dirname, 'repos.json'), 'utf8');
+	const repos = {};
+	for (const [fullName, options] of Object.entries(JSON.parse(raw).repos ?? {})) {
+		repos[fullName.toLowerCase()] = {
+			fullName,
+			label: fullName.split('/')[1],
+			colour: '#5865F2',
+			channelId: CHANNEL_ID,
+			...options,
+		};
+	}
+	return repos;
+};
 
-const octokit = new Octokit({
-	auth: process.env.GH_AUTH,
-});
+const repos = loadRepos();
 
-if (
-	process.env.TOKEN === undefined ||
-  process.env.GH_USER === undefined ||
-  process.env.GH_AUTH === undefined ||
-  process.env.ANNOTATOR_REPO === undefined ||
-	process.env.BOLT_REPO === undefined ||
-	process.env.DATA_PIPE_REPO === undefined ||
-	process.env.PROJECTS_REPO === undefined ||
-	process.env.PAYMENT_REPO === undefined ||
-	process.env.KAYA_REPO === undefined ||
-	process.env.ADMIN_REPO === undefined ||
-	process.env.PLAYGROUND_REPO === undefined ||
-	process.env.PROFILES_REPO === undefined ||
-  process.env.CHANNEL_ID === undefined ||
-  process.env.PORT === undefined
-) {
-	console.error('ERROR: Invalid process.environmental variables');
+const missing = [];
+if (!DISCORD_TOKEN) missing.push('DISCORD_TOKEN');
+if (Object.keys(repos).length === 0) missing.push('repos (repos.json ou REPOS_JSON)');
+for (const repo of Object.values(repos)) {
+	if (!repo.channelId) missing.push(`CHANNEL_ID (ou channelId pour ${repo.fullName})`);
+}
+if (missing.length > 0) {
+	console.error('ERREUR : configuration manquante :', missing.join(', '));
 	process.exit(1);
 }
+if (!GITHUB_WEBHOOK_SECRET) console.warn('ATTENTION : GITHUB_WEBHOOK_SECRET absent, les webhooks ne sont pas vérifiés');
+if (!GITHUB_TOKEN) console.warn('ATTENTION : GITHUB_TOKEN absent, seuls les repos publics marcheront (60 requêtes/h)');
 
+console.log('Repos suivis :', Object.values(repos).map(repo => repo.fullName).join(', '));
 
-// ? This is an object to assign colours to each embed depending on what repo it's from
-const repoList = {
-	[process.env.BOLT_REPO] : { colour: '#0000FF', PRs: [], amplify: true, pr_preview: 'https://test-pr-previews.dl5eewox9qmvx.amplifyapp.com/' },
-	[process.env.KAYA_REPO] : { colour: '#DA33FF', PRs: [], amplify: true, pr_preview: 'https://test-pr-previews.dk2lbhfysm2ic.amplifyapp.com/' },
-	[process.env.ADMIN_REPO] : { colour: '#9333FF', PRs: [], amplify: true, pr_preview: 'https://test.d1itkb6pz56lpp.amplifyapp.com/' },
-	[process.env.ANNOTATOR_REPO] : { colour: '#FF0000', PRs: [], amplify: false },
-	[process.env.DATA_PIPE_REPO] : { colour: '#00FF00', PRs: [], amplify: false },
-	[process.env.PROJECTS_REPO] : { colour: '#33FFF9', PRs: [], amplify: false },
-	[process.env.PAYMENT_REPO] : { colour: '#FFA833', PRs: [], amplify: false },
-	[process.env.PLAYGROUND_REPO] : { colour: '#E0FF33', PRs: [], amplify: false },
-	[process.env.PROFILES_REPO] : { colour: '#33FF33', PRs: [], amplify: false },
+// ? - Discord en REST uniquement : pas de connexion gateway, donc compatible avec Cloud Run (scale à zéro)
+const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
+let botUserId;
+const getBotUserId = async () => {
+	botUserId ??= (await rest.get(Routes.user())).id;
+	return botUserId;
 };
 
-
-// ?-  Function to check if message is already present in the chat, if so don't upload another one
-const checkIfPresent = async (channel, prURL) => {
-	await channel.messages.fetch({ limit: 100 }).then((messages) => {
-		messages.forEach((message) => {
-			if (message.embeds.length === 0) {
-				return false;
-			}
-			if (message.embeds[0].data.url === prURL) {
-				return true;
-			}
-		});
-	});
-	return false;
+// ? - Les 100 derniers messages du bot qui contiennent un embed de PR
+const fetchPrMessages = async (channelId) => {
+	const [messages, botId] = await Promise.all([
+		rest.get(Routes.channelMessages(channelId), { query: new URLSearchParams({ limit: '100' }) }),
+		getBotUserId(),
+	]);
+	return messages.filter(message => message.author.id === botId && message.embeds[0]?.url);
 };
 
-const getAmplify = async (repo, prNum, prRewviewURL) => {
-	let amplifyLink = '\`PR Link:\` ';
-	const regex = /https:\/\/pr\-[^\s]+/;
-	const responses = await octokit.request(`GET /repos/${repo}/issues/${prNum}/comments`, {
-		owner: 'Supahands',
-		repo: repo.slice('/'),
-		pull_number: prNum,
+const findPrMessage = async (repo, prUrl) =>
+	(await fetchPrMessages(repo.channelId)).find(message => message.embeds[0].url === prUrl);
+
+const github = async (route) => {
+	const response = await fetch(`https://api.github.com${route}`, {
+		headers: {
+			'Accept': 'application/vnd.github+json',
+			'X-GitHub-Api-Version': '2022-11-28',
+			...(GITHUB_TOKEN && { Authorization: `Bearer ${GITHUB_TOKEN}` }),
+		},
 	});
-	for (const response of responses.data) {
-		if (response.user.login === 'aws-amplify-us-west-2[bot]') {
-			console.log('PR LINK:', response.body.match(regex)[0]);
-			amplifyLink += await response.body.match(regex)[0];
-			amplifyLink += `\n\n \`Test link to login first with:\` ${prRewviewURL}/`;
-			amplifyLink += '\n\n<@795488563038912523> <@877389011965063168> <@169346852364222464>';
-		}
+	if (!response.ok) throw new Error(`GitHub ${response.status} sur ${route}`);
+	return response.json();
+};
+
+const buildEmbed = (repo, pr) => new EmbedBuilder()
+	.setColor(repo.colour)
+	.setTitle(`#${pr.number} : ${pr.title}`.slice(0, 256))
+	.setURL(pr.html_url)
+	.setAuthor({ name: pr.user.login, iconURL: pr.user.avatar_url, url: pr.user.html_url })
+	.setDescription(`\`${pr.head.ref}\` → \`${pr.base.ref}\``)
+	.addFields({ name: 'Repo', value: repo.fullName, inline: true }, { name: 'Projet', value: repo.label, inline: true })
+	.setTimestamp(new Date(pr.created_at))
+	.toJSON();
+
+// ? - Crée le message de la PR s'il n'existe pas, le met à jour si update est vrai
+const upsertPrMessage = async (repo, pr, { update = false } = {}) => {
+	const existing = await findPrMessage(repo, pr.html_url);
+	const body = { embeds: [buildEmbed(repo, pr)] };
+	if (existing) {
+		if (update) await rest.patch(Routes.channelMessage(repo.channelId, existing.id), { body });
+		return existing;
 	}
-
-	return amplifyLink;
+	if (repo.mentionRoleId) {
+		body.content = `<@&${repo.mentionRoleId}>`;
+		body.allowed_mentions = { roles: [repo.mentionRoleId] };
+	}
+	console.log('Nouvelle PR postée :', pr.html_url);
+	return rest.post(Routes.channelMessages(repo.channelId), { body });
 };
-// ? - Modify this, to accept the repo name as well, to assign colours to it
-const createEmbed = async (repo, pr, channel) => {
 
-	if (await checkIfPresent(channel, pr.html_url)) {
+const deletePrMessage = async (repo, prUrl) => {
+	const existing = await findPrMessage(repo, prUrl);
+	if (existing) await rest.delete(Routes.channelMessage(repo.channelId, existing.id));
+};
+
+const reactions = { APPROVED: '✅', CHANGES_REQUESTED: '❌', COMMENTED: '💬' };
+
+const react = (repo, message, emoji) =>
+	rest.put(Routes.channelMessageOwnReaction(repo.channelId, message.id, encodeURIComponent(emoji)));
+
+const applyReview = async (repo, message, state) => {
+	if (state === 'DISMISSED') {
+		await rest.delete(Routes.channelMessageOwnReaction(repo.channelId, message.id, encodeURIComponent(reactions.APPROVED)));
 		return;
 	}
-
-	const { number, title, commits } = pr;
-	const { avatar_url, login } = pr.user;
-	if (repoList[repo].amplify) {
-		const amplifyFieldData = await getAmplify(repo, number, repoList[repo].pr_preview);
-		const Embed = new EmbedBuilder()
-			.setColor(repoList[repo].colour)
-			.setTitle(`${number}: ${title}`)
-			.setURL(pr.html_url)
-			.setAuthor({ name: login, iconURL: null, url: pr.user.html_url })
-			.setThumbnail(avatar_url)
-			.addFields({
-				name: 'Repo',
-				value: `${repo}`,
-			},
-			{
-				name: 'Amplify details',
-				value: `${await amplifyFieldData}`,
-			})
-			.setDescription(
-				`${await amplifyFieldData === '\`PR Link:\` ' ? `Merge ${commits} commits into \`${pr.base.ref}\` from \`${pr.head.ref}\` ` : `Merge ${commits} commits into \`${pr.base.ref}\` from \`${pr.head.ref}\` <@&795488563038912523> <@877389011965063168> <@169346852364222464>`}`,
-			);
-		channel.send({ embeds: [Embed] });
-	}
-	else {
-
-		const Embed = new EmbedBuilder()
-			.setColor(repoList[repo].colour)
-			.setTitle(`${number}: ${title}`)
-			.setURL(pr.html_url)
-			.setAuthor({ name: login, iconURL: null, url: pr.user.html_url })
-			.setThumbnail(avatar_url)
-			.addFields({
-				name: 'Repo',
-				value: `${repo}`,
-			})
-			.setDescription(
-				`Merge ${commits} commits into \`${pr.base.ref}\` from \`${pr.head.ref}\` <@&795488563038912523>`,
-			);
-		channel.send({ embeds: [Embed] });
-	}
+	if (reactions[state]) await react(repo, message, reactions[state]);
 };
 
-// ? - Search through all messages, compare embed url with arguement URL, then delete message if it's the same
-const deleteMessage = async (channel, prURL) => {
-	channel.messages.fetch({ limit: 100 }).then((messages) => {
-		messages.forEach(async (message) => {
-			if (message.embeds[0].url === prURL) {
-				message.delete();
-			}
-		});
-	});
+const reactToPr = async (repo, prUrl, state) => {
+	const message = await findPrMessage(repo, prUrl);
+	if (message) await applyReview(repo, message, state.toUpperCase());
 };
 
-// ? - Updates all the reactions on the embeds
-const updateEmbed = async (channel, state, prURL) => {
-	channel.messages.fetch({ limit: 100 }).then((messages) => {
-		messages.forEach(async (message) => {
-			// ? - Switch statement for different message types, reaction for each different type
-			if (message.embeds[0].url === prURL) {
-				console.log('Review left for', prURL, ': ', state);
-				const approve1Reaction = '<:approve1:1081046953212776528>';
-				const approve2Reaction = '<:approve2:1081047016039252018>';
-				const messageReactions = [];
-				message.reactions.cache.forEach(async (reaction) => {
-					messageReactions.push(await reaction.emoji.name);
-				});
-				// ? - if action === submitted
-				console.log('Reactions for current message:', await messageReactions);
-				switch (state) {
-				case 'APPROVED':
-					try {
-						if (await messageReactions.includes('approve1') && await messageReactions.includes('approve2')) {
-							console.log('APPROVED');
-							break;
-						}
-						if (await !messageReactions.includes('approve1')) {
-							console.log('Adding approve1 reaction');
-							await message.react(approve1Reaction);
-							break;
-						}
-						if (await messageReactions.includes('approve1')) {
-							console.log('Approve 2 reaction');
-							await message.react(approve2Reaction);
-							break;
-						}
-						break;
-					}
-					catch (error) {
-						console.log(error);
-						break;
-					}
-				case 'CHANGES_REQUESTED':
-					await message.react('❌');
-					break;
-				case 'COMMENTED':
-					await message.react('💬');
-					break;
-					// ! Haven't found a way to remove a specific reaction only once from a message, only remove all (https://discordjs.guide/popular-topics/reactions.html#removing-reactions)
-				case 'dismissed':
-					break;
-				}
+// ? - Aligne le salon avec les PR ouvertes du repo : ajoute les manquantes, supprime les fermées ou en draft
+const syncRepo = async (repo) => {
+	const openPrs = (await github(`/repos/${repo.fullName}/pulls?state=open&per_page=100`)).filter(pr => !pr.draft);
+	const messages = (await fetchPrMessages(repo.channelId))
+		.filter(message => message.embeds[0].fields?.[0]?.value?.toLowerCase() === repo.fullName.toLowerCase());
 
-			}
-		});
-	});
-};
-
-// ? - Retrieves all PR data from each specified repo
-const getAllPRs = async () => {
-	for (const repo in repoList) {
-		const childObject = repoList[repo];
-		const repoName = repo.slice('/');
-		console.log('fetching repo: ', repo);
-
-		try {
-			const { data } = await octokit.request(`GET /repos/${repo}/pulls`, {
-				owner: 'supahands',
-				repo: repoName.slice('/'),
-				state: 'opened',
-			});
-			childObject.PRs = data;
-		}
-		catch (error) {
-			console.error(`Error fetching PRs for ${repo}: ${error.message}`);
+	for (const pr of openPrs) {
+		if (messages.some(message => message.embeds[0].url === pr.html_url)) continue;
+		const message = await upsertPrMessage(repo, pr);
+		for (const review of await github(`/repos/${repo.fullName}/pulls/${pr.number}/reviews`)) {
+			await applyReview(repo, message, review.state);
 		}
 	}
+
+	const openUrls = new Set(openPrs.map(pr => pr.html_url));
+	for (const message of messages) {
+		if (!openUrls.has(message.embeds[0].url)) await rest.delete(Routes.channelMessage(repo.channelId, message.id));
+	}
 };
-/*
-TODO: compare all embeds with all open PR's from the repo where the pull request came from
-	? - If pr is open and does not match any of the channel emebds url, create new embed and add to channel
-TODO: Look through messages in channel and update accordingly
- ? - If message is not an embed, delete it
- ? - If the PR attached to an embed is closed, delete the message
 
-*/
-const updateChannel = async (channel) => {
-	const chatEmbeds = [];
+const handleEvent = async (event, payload, repo) => {
+	const { action } = payload;
 
-	// ? - Update all repo objects with PR data
-	await getAllPRs();
-
-	const channelMessages = await channel.messages.fetch({ limit: 100 });
-	for (const message of channelMessages) {
-		if (message[1].embeds.length === 0) {
+	if (event === 'pull_request') {
+		const pr = payload.pull_request;
+		switch (action) {
+		case 'opened':
+		case 'reopened':
+		case 'ready_for_review':
+			if (!pr.draft) await upsertPrMessage(repo, pr);
 			break;
+		case 'edited':
+			if (!pr.draft) await upsertPrMessage(repo, pr, { update: true });
+			break;
+		case 'closed':
+		case 'converted_to_draft':
+			await deletePrMessage(repo, pr.html_url);
+			break;
+		default:
+			return `Action ignorée : pull_request.${action}`;
 		}
-		chatEmbeds.push(message[1].embeds[0]);
-	}
-	// ? - Check through all PR's of each repo to see if any are not displayed atm
-	for (const repoItem in repoList) {
-		const repoData = repoList[repoItem];
-		const prs = repoData.PRs;
-
-		// ? - If the PR is open and does not match any of the channel emebds url, create new embed and add to channel
-		for (const pr of prs) {
-			const prInChat = chatEmbeds.find(embed => embed.data.url === pr.html_url);
-			if (prInChat === undefined && pr.draft === false) {
-				await createEmbed(repoItem, pr, channel);
-			}
-		}
+		await syncRepo(repo);
+		return `OK : pull_request.${action}`;
 	}
 
-	// ? - Go through channel and delete all irrelevant messages
-	await channel.messages.fetch({ limit: 100 }).then((messages) => {
-		messages.every(async (message) => {
-			if (message.embeds.length === 0) {
-				return false;
-			}
+	if (event === 'pull_request_review' && action === 'submitted') {
+		await reactToPr(repo, payload.pull_request.html_url, payload.review.state);
+		return `OK : review ${payload.review.state}`;
+	}
 
-			// ? - If the message is not an embed, delete it
-			if (message.embeds === 0) {
-				message.delete();
-				return;
-			}
-			const messageEmbed = message.embeds[0];
-			const prNum = messageEmbed.data.title.split(':')[0];
-			const repo = messageEmbed.data.fields[0].value;
-			const prURL = messageEmbed.data.url;
+	if (event === 'pull_request_review_comment' && action === 'created') {
+		await reactToPr(repo, payload.pull_request.html_url, 'COMMENTED');
+		return 'OK : commentaire de review';
+	}
 
-			// ? - If the PR attached to an embed is closed, delete the message
-			const prInfo = await fetch(
-				`https://api.github.com/repos/${repo}/pulls/${prNum}`,
-				{
-					method: 'GET',
-					headers: {
-						Authorization: `Basic ${btoa(
-							`${process.env.GH_USER}:${process.env.GH_AUTH}`,
-						)}`,
-					},
-				},
-			).then((data) => data.json());
-			if (prInfo.state === 'closed') {
-				message.delete();
-				return;
-			}
+	if (event === 'issue_comment' && action === 'created' && payload.issue.pull_request) {
+		await reactToPr(repo, payload.issue.html_url, 'COMMENTED');
+		return 'OK : commentaire';
+	}
 
-			// ? - Update the reactions on the messages
-			const reviews = await octokit.request(`GET /repos/${repo}/pulls/${prNum}/reviews`, {
-				owner: 'Supahands',
-				repo: repo.slice('/')[1],
-				pull_number: prNum,
-			});
-
-			for (const review of reviews.data) {
-				const { state } = review;
-				await updateEmbed(channel, state, prURL);
-			}
-		});
-	});
+	return `Événement ignoré : ${event}.${action}`;
 };
 
+// ? - Les webhooks sont traités un par un pour éviter les doublons de messages
+let queue = Promise.resolve();
+const enqueue = (task) => {
+	const run = queue.catch(() => undefined).then(task);
+	queue = run;
+	return run;
+};
 
-app.post('/', async (req, res) => {
-	let channel = '';
-	let repoName = '';
-	let action = '';
-	let pr = '';
+const isValidSignature = (req) => {
+	if (!GITHUB_WEBHOOK_SECRET) return true;
+	const signature = Buffer.from(req.get('X-Hub-Signature-256') ?? '');
+	const expected = Buffer.from(`sha256=${crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET).update(req.rawBody ?? '').digest('hex')}`);
+	return signature.length === expected.length && crypto.timingSafeEqual(signature, expected);
+};
+
+const app = express();
+
+app.get('/', (_req, res) => res.send('OK'));
+
+app.post('/', express.json({ limit: '5mb', verify: (req, _res, buffer) => { req.rawBody = buffer; } }), async (req, res) => {
+	if (!isValidSignature(req)) return res.status(401).send('Signature invalide');
+
+	const event = req.get('X-GitHub-Event');
+	if (event === 'ping') return res.send('pong');
+
+	const repo = repos[req.body.repository?.full_name?.toLowerCase()];
+	if (!repo) return res.status(202).send(`Repo non suivi : ${req.body.repository?.full_name}`);
+
 	try {
-		channel = client.channels.cache.get(process.env.CHANNEL_ID);
-		repoName = req.body.repository.full_name;
-		action = req.body.action;
-		pr = req.body.pull_request;
+		res.send(await enqueue(() => handleEvent(event, req.body, repo)));
 	}
 	catch (error) {
-		console.log('Error:', error);
-		res.status(400).send(error);
-		return;
-	}
-
-	// ! Check for invalid repo
-	if (repoList[repoName] === undefined) {
-		console.error('Unsupported repo, please check that you spelt the repo correctly: ', repoName);
-		res.status(400).send('Unsupported repo, please check that you spelt the repo correctly: ' + repoName);
-		return;
-	}
-
-	// TODO: Set conditions for each of these actions:
-	/*
-	 TODO: Add for creation and deletion of embeds
-	 ? List of base pull request actions:
-	 * - opened : new pr request opened (Add that pr to chat + check if any other PR's are open)
-	 * - closed : pr closed (Delete specfied pr from chat)
-	 * - converted_to_draft : pr converted to draft (remove that from chat, also need to add condition in update to ignore it, until it is opened)
-	 ! - Can put logic in to ignore the ones below
-	 * - review_requested : fired each time you request a review from someone (so this happens alot)
-	 * - review_request_removed
-	 * - assigned: fired when a user is assigned to a pull request
-	 * - unassigned: fired when a user is unassigned from a pull request
-	 */
-
-	/*
-	  TODO: Add for update functionality
-		? List of pull_request_review actions:
-		* - submitted : review submitted
-		* - edited: review edited
-		* - dismissed: review dismissed
-		* - resolved: Review comment dispute had been resolved
-		! -  Look at the state key under the review object to see what sort of review it is
-			* - approved: review approved
-			* - changes_requested: asks for code changes
-			* - dismissed: review dismissed by owner
-		? There is also pull_request_comment or known as issue_comment, this uses the exact same syntax as review
-	*/
-	// >
-
-	if (action === 'opened') {
-		await createEmbed(repoName, pr, channel);
-		updateChannel(channel, repoName);
-		res.status(200).send('Updated and uploaded');
-	}
-	else if (action === 'closed' || action === 'converted_to_draft') {
-		await deleteMessage(channel, pr.html_url);
-		res.status(200).send('Deleted');
-	}
-	// ? - Updating review
-	else if (action === 'submitted') {
-		const reviewState = req.body.review.state.toUpperCase();
-		await updateEmbed(channel, reviewState, pr.html_url);
-		res.status(200).send(`Reacted: ${reviewState}`);
-	}
-	// ? - Updating comments
-	else if (action === 'created') {
-		const state = 'COMMENTED';
-		await updateEmbed(channel, state, pr.html_url);
-		res.status(200).send('Commented');
-	}
-	else {
-		res.status(400).send('Unsupported action, please check that you spelt the action correctly: ' + action);
+		console.error(`Erreur sur ${event}.${req.body.action} (${repo.fullName}) :`, error);
+		res.status(500).send('Erreur interne');
 	}
 });
 
-// ? - Specify port for server to listen on
-app.listen(process.env.PORT || 3000, () => {
-	console.log(`Listening on port ${process.env.PORT || 3000}`);
-});
-// ? - Listen for when bot is connected to Discord (i.e. logged in)
-client.on('ready', () => {
-	console.log(
-		`Logged in as ${client.user ? client.user.tag : 'no user defined'}`,
-	);
-});
-
-// ? - Proceed with connecting to Discord (login)
-client.login(process.env.TOKEN);
+app.listen(PORT, () => console.log(`En écoute sur le port ${PORT}`));
