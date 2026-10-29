@@ -1,0 +1,25 @@
+{
+  "name": "Discord-pr-puller",
+  "version": "1.0.0",
+  "description": "A script that gathers data from select github repositories and sends it to Discord",
+  "main": "bot.js",
+  "author": "lNalator",
+  "license": "MIT",
+  "private": true,
+  "dependencies": {
+    "btoa": "^1.2.1",
+    "discord.js": "^14.7.1",
+    "dotenv": "^16.0.3",
+    "express": "^4.17.1",
+    "octokit": "^2.0.14"
+  },
+  "scripts": {
+    "start": "node bot.js",
+    "build": "npm install"
+  },
+  "devDependencies": {
+    "eslint": "^8.33.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-plugin-import": "^2.27.5"
+  }
+}
